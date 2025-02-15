@@ -153,8 +153,8 @@ class SynthModule(nn.Module):
         length output.
         """
         signal = self.output(*args, **kwargs)
-        buffered = self.to_buffer_size(signal)
-        return buffered
+        # buffered = self.to_buffer_size(signal)
+        return signal
 
     def add_parameters(self, parameters: List[ModuleParameter]):
         """
@@ -541,15 +541,15 @@ class VCO(SynthModule):
         ),
     ]
 
-    def output(self, midi_f0: T, mod_signal: Optional[Signal] = None) -> Signal:
+    def output(self, midi_notes: T, midi_notes_length: T, mod_signal: Optional[Signal] = None) -> Signal:
         """
         Generates audio signal from modulation signal.
 
         Args:
-            midi_f0: Fundamental of note in midi note value (0-127).
+            midi_notes: Fundamental of notes in midi note values (0-127).
+            midi_notes_length: Length of notes is seconds.
             mod_signal: Modulation signal to apply to the pitch.
         """
-        assert midi_f0.shape == (self.batch_size,)
 
         if mod_signal is not None and mod_signal.shape != (
             self.batch_size,
@@ -562,42 +562,55 @@ class VCO(SynthModule):
                 "being passed in is at full audio sampling rate."
             )
 
-        control_as_frequency = self.make_control_as_frequency(midi_f0, mod_signal)
-
+        control_as_frequency = self.make_control_as_frequency(midi_notes, midi_notes_length, mod_signal)
+        
         if self.synthconfig.debug:
             assert (control_as_frequency >= 0).all() and (
                 control_as_frequency <= self.nyquist
             ).all()
-
+            
         cosine_argument = self.make_argument(control_as_frequency)
         cosine_argument += self.p("initial_phase").unsqueeze(1)
-        output = self.oscillator(cosine_argument, midi_f0)
+        output = self.oscillator(cosine_argument, midi_notes)
+        
         return output.as_subclass(Signal)
 
     def make_control_as_frequency(
-        self, midi_f0: T, mod_signal: Optional[Signal] = None
+        self, midi_notes: T, midi_notes_length: T, mod_signal: Optional[Signal] = None
     ) -> Signal:
         """
         Generates a time-varying control signal in frequency (Hz) from a midi
         fundamental pitch and pitch-modulation signal.
 
         Args:
-            midi_f0: Fundamental pitch value in midi.
+            midi_notes: Fundamental pitch value in midi.
+            midi_notes_length: Length of notes is seconds.
             mod_signal: Pitch modulation signal in midi.
         """
-        midi_f0 = (midi_f0 + self.p("tuning")).unsqueeze(1)
-
+        
+        # TODO: try to paralelize this
+        max_length = torch.max(torch.sum(midi_notes_length, dim=1))        
+        buffer_size = (max_length * self.sample_rate).int()
+        
+        final_songs = torch.empty((midi_notes.shape[0], buffer_size), device=midi_notes.device)
+        for i in range(midi_notes.shape[0]):
+            note_repeats = (midi_notes_length[i] * self.sample_rate).int()
+            notes = midi_notes[i].repeat_interleave(note_repeats)
+            notes = F.pad(notes, (0, buffer_size - notes.shape[0]))
+            final_songs[i] = notes
+        midi_notes = final_songs        
+        
         # If there is no modulation, then convert the midi_f0 values to
         # frequency and return an expanded view that contains buffer size
         # number of values
         if mod_signal is None:
-            control_hz = util.midi_to_hz(midi_f0)
-            return control_hz.expand(-1, self.buffer_size)
+            return util.midi_to_hz(midi_notes)
 
+        # TODO: handle this in case of modulation
         # If there is modulation, then add that to the fundamental,
         # clamp to a range [0.0, 127.0], then return in frequency Hz.
         modulation = self.p("mod_depth").unsqueeze(1) * mod_signal
-        control = torch.clamp(midi_f0 + modulation, 0.0, 127.0)
+        control = torch.clamp(midi_notes + modulation, 0.0, 127.0)
         return util.midi_to_hz(control)
 
     def make_argument(self, freq: Signal) -> Signal:
@@ -635,6 +648,7 @@ class SineVCO(VCO):
             argument: The phase of the oscillator at each time sample.
             midi_f0: Fundamental frequency in midi (ignored in this VCO).
         """
+        
         return torch.cos(argument)
 
 

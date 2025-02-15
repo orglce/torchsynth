@@ -188,7 +188,7 @@ class AbstractSynth(LightningModule):
         raise NotImplementedError("Derived classes must override this method")
 
     def forward(
-        self, batch_idx: Optional[int] = None, *args: Any, **kwargs: Any
+        self, batch_idx: Optional[int] = None, midi_notes: Optional[torch.Tensor] = None, midi_notes_length: Optional[torch.Tensor] = None, *args: Any, **kwargs: Any
     ) -> Tuple[Signal, torch.Tensor, Union[torch.Tensor, None]]:  # pragma: no cover
         """
         Wrapper around `output`, which optionally randomizes the
@@ -214,6 +214,20 @@ class AbstractSynth(LightningModule):
             batch_size Boolean tensor of is this example train [or test],
             None if batch_idx is None)
         """
+        self.midi_notes = midi_notes
+        self.midi_notes_length = midi_notes_length
+        
+        if self.midi_notes is not None and self.midi_notes.shape[0] != self.batch_size.item():
+            raise ValueError(
+                f"The number of songs must be equal to the batch size."
+                f"Got {self.midi_notes.shape[0]} songs and {self.batch_size} batch size."
+            )
+        if self.midi_notes.shape != self.midi_notes_length.shape:
+            raise ValueError(
+                f"The number of notes must be equal to notes length."
+                f"Got {self.midi_notes.shape} and {self.midi_notes_length.shape}."
+            )
+
         if self.synthconfig.reproducible and batch_idx is None:
             raise ValueError(
                 "Reproducible mode is on, you must "
