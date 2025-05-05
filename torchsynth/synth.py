@@ -60,13 +60,17 @@ class AbstractSynth(LightningModule):
             is provided, we use our defaults.
     """
 
-    def __init__(self, synthconfig: Optional[SynthConfig] = None, *args, **kwargs):
+    def __init__(self, synthconfig: Optional[SynthConfig] = None, device=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if synthconfig is not None:
             self.synthconfig = synthconfig
         else:
             # Use the default
             self.synthconfig = SynthConfig()
+        if device is None:
+            self._device = torch.get_default_device()
+        else:
+            self._device = device
 
     @property
     def batch_size(self) -> T:
@@ -87,6 +91,14 @@ class AbstractSynth(LightningModule):
     def buffer_size_seconds(self) -> T:
         assert self.synthconfig.buffer_size_seconds.ndim == 0
         return self.synthconfig.buffer_size_seconds
+    
+    @property
+    def device(self):
+        return self._device
+    
+    @device.setter
+    def device(self, device):
+        self._device = device
 
     def add_synth_modules(
         self, modules: List[Tuple[str, SynthModule, Optional[Dict[str, Any]]]]
@@ -188,7 +200,13 @@ class AbstractSynth(LightningModule):
         raise NotImplementedError("Derived classes must override this method")
 
     def forward(
-        self, batch_idx: Optional[int] = None, midi_notes: Optional[torch.Tensor] = None, midi_notes_length: Optional[torch.Tensor] = None, *args: Any, **kwargs: Any
+        self, batch_idx: Optional[int] = None, 
+        midi_notes: Optional[torch.Tensor] = None, 
+        midi_notes_start: Optional[torch.Tensor] = None,
+        midi_notes_length: Optional[torch.Tensor] = None, 
+        midi_attacks: Optional[torch.Tensor] = None,
+        midi_decays: Optional[torch.Tensor] = None,
+        *args: Any, **kwargs: Any
     ) -> Tuple[Signal, torch.Tensor, Union[torch.Tensor, None]]:  # pragma: no cover
         """
         Wrapper around `output`, which optionally randomizes the
@@ -216,6 +234,9 @@ class AbstractSynth(LightningModule):
         """
         self.midi_notes = midi_notes
         self.midi_notes_length = midi_notes_length
+        self.midi_attacks = midi_attacks
+        self.midi_decays = midi_decays
+        self.midi_notes_start = midi_notes_start
         
         if self.midi_notes is not None and self.midi_notes.shape[0] != self.batch_size.item():
             raise ValueError(
@@ -369,9 +390,10 @@ class AbstractSynth(LightningModule):
             new_values = []
             for i in range(self.batch_size):
                 cpu_rng.manual_seed(seed * self.batch_size.numpy().item() + i)
-                new_values.append(
-                    torch.rand((len(parameters),), device="cpu", generator=cpu_rng)
-                )
+                value = torch.rand((len(parameters),), device="cpu", generator=cpu_rng)
+                # value = torch.ones((len(parameters),), device="cpu")
+                new_values.append(value)
+                
 
             # Move to device if necessary
             new_values = torch.stack(new_values, dim=1)
@@ -382,6 +404,7 @@ class AbstractSynth(LightningModule):
             for i, parameter in enumerate(parameters):
                 if not ModuleParameter.is_parameter_frozen(parameter):
                     parameter.data = new_values[i]
+                    
         else:
             assert not self.synthconfig.reproducible
             for parameter in parameters:

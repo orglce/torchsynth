@@ -5,6 +5,7 @@ Synth modules in Torch.
 import copy
 from typing import Any, Dict, List, Optional, Tuple
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,6 +53,7 @@ class SynthModule(nn.Module):
         device: Optional[torch.device] = None,
         **kwargs: Dict[str, T],
     ):
+        
         nn.Module.__init__(self)
         self.synthconfig = synthconfig
         self.device = device
@@ -369,7 +371,7 @@ class ADSR(ControlRateModule):
             "range", torch.arange(self.control_buffer_size, device=self.device)
         )
 
-    def output(self, note_on_duration: T) -> Signal:
+    def output(self, note_on_duration: T, notes, decays, attacks) -> Signal:
         """Generate an ADSR envelope.
 
         By default, this envelope reacts as if it was triggered with midi, for
@@ -403,15 +405,90 @@ class ADSR(ControlRateModule):
         decay = self.p("decay")
         self.alpha = self.p("alpha").unsqueeze(1)
 
-        new_attack = torch.minimum(attack, note_on_duration)
-        new_decay = torch.maximum(note_on_duration - attack, self.zero)
+        note_on_duration_orig = torch.rand(self.batch_size, device=note_on_duration.device)
+
+        new_attack = torch.minimum(attack, note_on_duration_orig)
+        new_decay = torch.maximum(note_on_duration_orig - attack, self.zero)
         new_decay = torch.minimum(new_decay, decay)
 
         attack_signal = self.make_attack(new_attack)
         decay_signal = self.make_decay(new_attack, new_decay)
-        release_signal = self.make_release(note_on_duration)
+        release_signal = self.make_release(note_on_duration_orig)
 
         return (attack_signal * decay_signal * release_signal).as_subclass(Signal)
+
+      
+        B, N = notes.shape
+        num_samples = 1000  # total envelope length in samples
+
+        # Total duration per batch (in seconds)
+        total_time = notes.sum(dim=1)  # shape: (B,)
+
+        # Compute cumulative note times for each batch
+        cumsum = torch.cumsum(notes, dim=1)  # shape: (B, N)
+        zeros = torch.zeros((B, 1), dtype=torch.float32, device=note_on_duration.device)
+        # Note start and end indices (in samples) per batch
+        note_starts = torch.floor(torch.cat([zeros, cumsum[:, :-1]], dim=1) / total_time.unsqueeze(1) * num_samples).long()
+        note_ends   = torch.floor(cumsum / total_time.unsqueeze(1) * num_samples).long()
+        note_ends[:, -1] = num_samples  # ensure last note reaches the end
+
+        # Note lengths in samples (B, N)
+        note_lengths = note_ends - note_starts
+        note_lengths_f = note_lengths.to(torch.float32)
+
+        # Convert attack and decay durations (in seconds) to samples for each note,
+        # scaling by the batch's total duration.
+        attack_samples = torch.clamp(torch.floor(attacks / total_time.unsqueeze(1) * num_samples).long(), min=1)
+        decay_samples  = torch.clamp(torch.floor(decays / total_time.unsqueeze(1) * num_samples).long(), min=1)
+
+        # Expand dimensions for vectorized (B, N, S) operations:
+        attack_samples_exp = attack_samples.to(torch.float32).unsqueeze(2)  # (B, N, 1)
+        decay_samples_exp  = decay_samples.to(torch.float32).unsqueeze(2)   # (B, N, 1)
+        note_lengths_exp   = note_lengths_f.unsqueeze(2)                   # (B, N, 1)
+
+        # Create a grid of sample indices (shape: (1, 1, num_samples))
+        sample_idx = torch.arange(num_samples, device=note_on_duration.device).unsqueeze(0).unsqueeze(0).to(torch.float32)
+
+        # Expand note boundaries to (B, N, 1)
+        note_starts_exp = note_starts.unsqueeze(2).to(torch.float32)
+        note_ends_exp   = note_ends.unsqueeze(2).to(torch.float32)
+
+        # For each note in each batch, compute time offset (dt) from the note start:
+        dt = sample_idx - note_starts_exp  # (B, N, num_samples)
+
+        # Mask for samples that fall within each note's boundaries:
+        in_note = (sample_idx >= note_starts_exp) & (sample_idx < note_ends_exp)
+
+        # Define custom exponent for ramp shapes (attack and decay)
+        exponent = 3.0
+
+        # Initialize note envelope (B, N, num_samples)
+        env_note = torch.zeros_like(dt)
+
+        # Define phase masks:
+        mask_attack  = dt < attack_samples_exp
+        mask_decay   = dt >= (note_lengths_exp - decay_samples_exp)
+        mask_sustain = (dt >= attack_samples_exp) & (dt < (note_lengths_exp - decay_samples_exp))
+
+        # Compute attack ramp: ramp from 0 to 1
+        attack_ramp = (dt / attack_samples_exp).clamp(max=1.0).pow(exponent)
+        # Sustain: amplitude 1
+        sustain_val = torch.ones_like(dt)
+        # Decay ramp: ramp from 1 to 0 over decay_samples
+        decay_ramp = ((note_lengths_exp - dt) / decay_samples_exp).clamp(max=1.0).pow(exponent)
+
+        # Combine phases using masks:
+        env_note = torch.where(mask_attack, attack_ramp, env_note)
+        env_note = torch.where(mask_sustain, sustain_val, env_note)
+        env_note = torch.where(mask_decay, decay_ramp, env_note)
+        # Zero out samples outside the note boundaries
+        env_note = env_note * in_note.to(torch.float32)
+
+        # Sum over notes for each batch to get the final envelope (B, num_samples)
+        envelope = env_note.sum(dim=1)
+        return envelope.as_subclass(Signal)
+
+
 
     def ramp(
         self, duration: T, start: Optional[T] = None, inverse: Optional[bool] = False
@@ -500,6 +577,253 @@ class ADSR(ControlRateModule):
             f"""alpha={self.torchparameters['alpha']}"""
         )
 
+class Effect(SynthModule):
+    
+    default_parameter_ranges: List[ModuleParameterRange] = []
+    
+    def output(self, signal: T) -> Signal:
+        """
+        Generates audio signal from modulation signal.
+
+        Args:
+            midi_notes: Fundamental of notes in midi note values (0-127).
+            midi_notes_length: Length of notes is seconds.
+            mod_signal: Modulation signal to apply to the pitch.
+        """
+
+        return self.apply_effect(signal)
+
+    def apply_effect(self, signal: T) -> Signal:
+        raise NotImplementedError("Derived classes must override this method")
+        """
+        This function accepts a phase argument and generates output audio. It is
+        implemented by the child class.
+
+        Args:
+            argument: The phase of the oscillator at each time sample.
+            midi_f0: Fundamental frequency in midi.
+        """
+        raise NotImplementedError("Derived classes must override this method")
+
+class Flanger(Effect):
+    
+    default_parameter_ranges: List[
+        ModuleParameterRange
+    ] = Effect.default_parameter_ranges + [
+        ModuleParameterRange(
+            0.0, 20, name="frequency", description="Frequency of the overdrive"
+        ),
+        ModuleParameterRange(
+            0.0, 100.0, name="offsets", description="Offsets of the overdrive"
+        ),
+        ModuleParameterRange(
+            0.0, 0.5, name="delay", description="Delay of the echo"
+        ),
+        ModuleParameterRange(
+            1.0, 2.0, name="drive", description="Drive"
+        ),
+        ModuleParameterRange(
+            1.0, 2.0, name="distortion_drive", description="Distortion drive"
+        ),
+    ]
+    
+    
+    def apply_effect(self, signal: T):
+           
+        frequency = self.p("frequency").unsqueeze(1)
+        delay = self.p("delay").unsqueeze(1)
+        drive = self.p("drive").unsqueeze(1)
+        distortion_drive = self.p("distortion_drive").unsqueeze(1)
+        # offsets_size = self.p("offsets").unsqueeze(1)
+        # print(frequency[1])
+        # x = torch.linspace(0, 1, signal.shape[1], device=signal.device)
+        # x = x.unsqueeze(0)
+        # lfo = (torch.sin(2 * math.pi * x * frequency))
+
+        # offsets = (lfo * 100).long()
+        # indices = torch.arange(signal.shape[1], device=signal.device) - offsets
+        # indices = torch.clamp(indices, min=0)
+        # signal[:, 0:] = torch.gather(signal, 1, indices[:, 0:])
+       
+        def echo(signal, sr, delay=0.3, decay=0.5, mix=0.5):
+            """
+            Apply an echo effect to a batch of signals.
+            
+            Parameters:
+            signal (torch.Tensor): Input tensor of shape (n, L) where L is the number of samples.
+            sr (int): Sampling rate.
+            delay (float or torch.Tensor): Echo delay time in seconds.
+                If a tensor, it should have shape (n,) so each signal can have its own delay.
+            decay (float): Attenuation factor for the echo.
+            mix (float): Mix ratio between original and echo (0 = clean, 1 = fully echo).
+            
+            Returns:
+            torch.Tensor: Processed signal with echo effect.
+            """
+            n, L = signal.shape
+            device = signal.device
+
+            # Ensure delay is a tensor of shape (n,)
+            if not torch.is_tensor(delay):
+                delay = torch.full((n,), delay, device=device)
+            else:
+                delay = delay.to(device)
+            
+            # Convert delay time (seconds) to samples (integer)
+            delay_samples = (delay * sr).long()  # shape: (n,)
+            
+            # Create a time index grid for each signal
+            indices = torch.arange(L, device=device).view(1, L).expand(n, L)  # shape: (n, L)
+            delay_samples = delay_samples.view(n, 1)  # shape: (n, 1)
+            
+            # Compute source indices for echo (delayed by delay_samples)
+            src_indices = indices - delay_samples  # shape: (n, L)
+            
+            # Create a mask for valid indices (indices < 0 will be zeroed)
+            valid_mask = (src_indices >= 0)
+            src_indices_clamped = src_indices.clamp(min=0)
+            
+            # Gather delayed samples using the computed indices
+            echo_signal = torch.gather(signal, 1, src_indices_clamped)
+            
+            # Zero out samples where the delay would have been negative and apply decay factor
+            echo_signal = echo_signal * valid_mask.float() * decay
+            
+            # Mix the original and echo signals
+            output = (1 - mix) * signal + mix * echo_signal
+            return output
+        
+        def overdrive(signal, drive=10.0, mix=1.0):
+            """
+            Apply an overdrive (soft clipping) effect to a batch of signals.
+            
+            Parameters:
+            signal (torch.Tensor): Input tensor of shape (n, L) where L is number of samples.
+            drive (float or torch.Tensor): Gain applied before distortion.
+                If a tensor of shape (n,), each signal gets its own drive value.
+            mix (float): Mix ratio between original and distorted signals (0=clean, 1=fully distorted).
+            
+            Returns:
+            torch.Tensor: Processed signal with overdrive effect.
+            """
+            n, L = signal.shape
+            device = signal.device
+
+            # Ensure drive is a tensor with shape (n, 1)
+            if not torch.is_tensor(drive):
+                drive = torch.full((n, 1), drive, device=device)
+            else:
+                if drive.ndim == 1:
+                    drive = drive.unsqueeze(1)
+
+            # Apply gain and then soft-clip using tanh
+            amplified = drive * signal
+            distorted = torch.tanh(amplified)
+            
+            # Mix the original and distorted signals
+            output = (1 - mix) * signal + mix * distorted
+            return output
+        
+        def distortion(signal, drive=1.0, threshold=0.5, mix=1.0):
+            """
+            Apply a hard-clipping distortion effect to a batch of signals.
+            
+            Parameters:
+            signal (torch.Tensor): Input tensor of shape (n, L) where L is number of samples.
+            drive (float or torch.Tensor): Gain applied before clipping. If a tensor, it should have shape (n,).
+            threshold (float or torch.Tensor): Clipping threshold. If a tensor, it should have shape (n,).
+            mix (float): Blend ratio between original and distorted signals (0 = clean, 1 = fully distorted).
+            
+            Returns:
+            torch.Tensor: Distorted signal.
+            """
+            n, L = signal.shape
+            device = signal.device
+
+            # Ensure drive is a tensor of shape (n, 1)
+            if not torch.is_tensor(drive):
+                drive = torch.full((n,), drive, device=device)
+            if drive.ndim == 1:
+                drive = drive.unsqueeze(1)
+
+            # Ensure threshold is a tensor of shape (n, 1)
+            if not torch.is_tensor(threshold):
+                threshold = torch.full((n,), threshold, device=device)
+            if threshold.ndim == 1:
+                threshold = threshold.unsqueeze(1)
+
+            # Apply drive (gain)
+            amplified = drive * signal
+
+            # Expand threshold to match signal shape
+            threshold_expanded = threshold.expand(n, L)
+            
+            # Hard clipping distortion
+            clipped = torch.clamp(amplified, -threshold_expanded, threshold_expanded)
+            
+            # Normalize the clipped signal to [-1, 1]
+            distorted = clipped / threshold_expanded
+
+            # Mix original and distorted signals
+            output = (1 - mix) * signal + mix * distorted
+            return output
+                
+        def flanger(signal, sr, base_delay=0.002, depth=0.001, mod_freq=0.25, mix=0.5):
+            """
+            Apply a flanger effect to a batch of signals with individual modulation rates.
+            
+            Parameters:
+            signal (torch.Tensor): Input tensor of shape (n, L) where L is the number of samples.
+            sr (int): Sampling rate.
+            base_delay (float): Base delay in seconds.
+            depth (float): Modulation depth (additional delay in seconds).
+            mod_freq (float or torch.Tensor): 
+                If scalar, applies the same modulation frequency (in Hz) to all signals.
+                If a tensor of shape (n,), each signal uses its own modulation frequency.
+            mix (float): Mix ratio between original and delayed signals.
+            
+            Returns:
+            torch.Tensor: Processed signal with flanger effect.
+            """
+            n, L = signal.shape
+            device = signal.device
+
+            # Create time indices (broadcasted across signals)
+            indices = torch.arange(L, device=device).float().unsqueeze(0)  # shape (1, L)
+            
+            # Ensure mod_freq is a tensor of shape (n, 1)
+            if not torch.is_tensor(mod_freq):
+                mod_freq = torch.full((n, 1), mod_freq, device=device)
+            else:
+                if mod_freq.ndim == 1:
+                    mod_freq = mod_freq.unsqueeze(1)
+            
+            # Compute modulated delay (in samples) for each signal
+            delay = base_delay * sr + depth * sr * torch.sin(2 * math.pi * mod_freq * indices / sr)
+            
+            # Compute delayed indices and clamp to valid range
+            delayed_indices = torch.clamp(indices - delay, 0, L - 1)
+            
+            # Linear interpolation for fractional delay
+            i0 = delayed_indices.floor().long()  # shape (n, L)
+            i1 = torch.clamp(i0 + 1, max=L - 1)    # shape (n, L)
+            frac = delayed_indices - i0.float()     # shape (n, L)
+            
+            # Gather delayed samples using linear interpolation
+            delayed_signal = (1 - frac) * signal.gather(1, i0) + frac * signal.gather(1, i1)
+            
+            # Mix the original and delayed signals
+            output = (1 - mix) * signal + mix * delayed_signal
+            return output
+        
+        signal = flanger(signal, self.sample_rate, mod_freq=frequency)
+        signal = overdrive(signal, drive=drive)
+        signal = echo(signal, self.sample_rate, delay=delay)
+        signal = distortion(signal, drive=distortion_drive)
+
+        return signal
+    
+    
 
 class VCO(SynthModule):
     """
@@ -541,7 +865,14 @@ class VCO(SynthModule):
         ),
     ]
 
-    def output(self, midi_notes: T, midi_notes_length: T, mod_signal: Optional[Signal] = None) -> Signal:
+    def output(
+        self, 
+        midi_notes: T, 
+        midi_notes_start: T,
+        midi_notes_length: T, 
+        midi_notes_attacks: T,
+        midi_notes_decays: T,
+        mod_signal: Optional[Signal] = None) -> Signal:
         """
         Generates audio signal from modulation signal.
 
@@ -562,21 +893,39 @@ class VCO(SynthModule):
                 "being passed in is at full audio sampling rate."
             )
 
-        control_as_frequency = self.make_control_as_frequency(midi_notes, midi_notes_length, mod_signal)
+        env, frequencies = self.make_control_as_frequency(
+            midi_notes, 
+            midi_notes_start, 
+            midi_notes_length,
+            midi_notes_attacks,
+            midi_notes_decays,
+            mod_signal)
         
+        sinusoids = env * self.oscillator(frequencies, midi_notes)
+
+        audio = sinusoids.sum(dim=1)
+        audio = audio / audio.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+        return audio.as_subclass(Signal)
+        
+        return sinusoids_frequencies.as_subclass(Signal)
         if self.synthconfig.debug:
-            assert (control_as_frequency >= 0).all() and (
-                control_as_frequency <= self.nyquist
+            assert (sinusoids_frequencies >= 0).all() and (
+                sinusoids_frequencies <= self.nyquist
             ).all()
             
-        cosine_argument = self.make_argument(control_as_frequency)
+        cosine_argument = self.make_argument(sinusoids_frequencies)
         cosine_argument += self.p("initial_phase").unsqueeze(1)
         output = self.oscillator(cosine_argument, midi_notes)
-        
         return output.as_subclass(Signal)
 
     def make_control_as_frequency(
-        self, midi_notes: T, midi_notes_length: T, mod_signal: Optional[Signal] = None
+        self, 
+        midi_notes: T, 
+        midi_notes_start: T,
+        midi_notes_length: T, 
+        midi_notes_attacks: T,
+        midi_notes_decays: T,
+        mod_signal: Optional[Signal] = None
     ) -> Signal:
         """
         Generates a time-varying control signal in frequency (Hz) from a midi
@@ -588,22 +937,54 @@ class VCO(SynthModule):
             mod_signal: Pitch modulation signal in midi.
         """
         
-        # TODO: try to paralelize this
-        max_length = torch.max(torch.sum(midi_notes_length, dim=1))        
-        buffer_size = (max_length * self.sample_rate).int()
+        # # TODO: try to paralelize this
+        # max_length = torch.max(torch.sum(midi_notes_length, dim=1))        
+        # buffer_size = (max_length * self.sample_rate).int()
         
-        final_songs = torch.empty((midi_notes.shape[0], buffer_size), device=midi_notes.device)
-        for i in range(midi_notes.shape[0]):
-            note_repeats = (midi_notes_length[i] * self.sample_rate).int()
-            notes = midi_notes[i].repeat_interleave(note_repeats)
-            notes = F.pad(notes, (0, buffer_size - notes.shape[0]))
-            final_songs[i] = notes
-        midi_notes = final_songs        
+        # final_songs = torch.empty((midi_notes.shape[0], buffer_size), device=midi_notes.device)
+        # for i in range(midi_notes.shape[0]):
+        #     note_repeats = (midi_notes_length[i] * self.sample_rate).int()
+        #     notes = midi_notes[i].repeat_interleave(note_repeats)
+        #     notes = F.pad(notes, (0, buffer_size - notes.shape[0]))
+        #     final_songs[i] = notes
+        # midi_notes = final_songs        
+        
+        total_duration = self.synthconfig.buffer_size_seconds
+        buffer_size = (total_duration * self.sample_rate).int()
+
+        midi_notes = util.midi_to_hz(midi_notes)
+        t = torch.linspace(0, total_duration, steps=buffer_size, device=midi_notes.device)
+
+        t = t.unsqueeze(0).unsqueeze(0)
+        midi_notes = midi_notes.unsqueeze(-1)
+        midi_notes_start = midi_notes_start.unsqueeze(-1)
+        midi_notes_length = midi_notes_length.unsqueeze(-1)
+        midi_notes_attacks = midi_notes_attacks.unsqueeze(-1)
+        midi_notes_decays = midi_notes_decays.unsqueeze(-1)
+
+        t_offset = t - midi_notes_start  # shape: [B, N, buffer_size]
+        note_mask = (t_offset >= 0) & (t_offset < midi_notes_length)
+
+        env = torch.ones_like(t_offset)
+        env = torch.where(
+            (t_offset >= 0) & (t_offset < midi_notes_attacks),
+            (t_offset / midi_notes_attacks)**3,
+            env
+        )
+        env = torch.where(
+            (t_offset > (midi_notes_length - midi_notes_decays)) & (t_offset < midi_notes_length),
+            ((midi_notes_length - t_offset) / midi_notes_decays)**3,
+            env
+        )
+        env = env * note_mask.float()
+        return env, midi_notes * t_offset
+      
         
         # If there is no modulation, then convert the midi_f0 values to
         # frequency and return an expanded view that contains buffer size
         # number of values
         if mod_signal is None:
+            print("midi notes", midi_notes.shape)
             return util.midi_to_hz(midi_notes)
 
         # TODO: handle this in case of modulation
@@ -621,7 +1002,7 @@ class VCO(SynthModule):
         Args:
             freq: Time-varying instantaneous frequency in Hz.
         """
-        return torch.cumsum(2 * torch.pi * freq / self.sample_rate, dim=1)
+        return torch.cumsum(freq / self.sample_rate, dim=1)
 
     def oscillator(self, argument: Signal, midi_f0: T) -> Signal:
         """
@@ -649,8 +1030,60 @@ class SineVCO(VCO):
             midi_f0: Fundamental frequency in midi (ignored in this VCO).
         """
         
-        return torch.cos(argument)
+        return torch.cos(2 * torch.pi * argument)
+    
 
+class TriangleVCO(VCO):
+    """
+    Simple VCO that generates a pitched sinusoid.
+    """
+
+    default_parameter_ranges: List[
+        ModuleParameterRange
+    ] = VCO.default_parameter_ranges + [
+        ModuleParameterRange(
+            0.0, 1.0, name="shape", description="Shape of the triangle waveform, the roundness of the wave"
+        )
+    ]
+    def oscillator(self, argument: Signal, midi_f0: T) -> Signal:
+        """
+        A cosine oscillator. ...Good ol' cosine.
+
+        Args:
+            argument: The phase of the oscillator at each time sample.
+            midi_f0: Fundamental frequency in midi (ignored in this VCO).
+        """
+        
+        wave = 4 * torch.abs(argument - torch.floor(argument + 0.5)) - 1
+        exponent = (self.p("shape") * 10 + 1).int().unsqueeze(1).unsqueeze(2)
+        return torch.pow(wave, exponent)
+
+
+class SquareSawVCO(VCO):
+    """
+    Simple VCO that generates a square/saw wave.
+    """
+
+    default_parameter_ranges: List[
+        ModuleParameterRange
+    ] = VCO.default_parameter_ranges + [
+        ModuleParameterRange(
+            0.0, 1.0, name="shape", description="Shape of the waveform, 0 is square, 1 is saw"
+        )
+    ]
+
+    def oscillator(self, argument: Signal, midi_f0: T) -> Signal:
+        """
+        A sqare/saw oscillator.
+
+        Args:
+            argument: The phase of the oscillator at each time sample.
+            midi_f0: Fundamental frequency in midi (ignored in this VCO).
+        """
+
+        shape = self.p("shape").unsqueeze(1).unsqueeze(2)
+        return shape*(torch.sign(torch.cos(2 * torch.pi * argument))) + (1-shape)*(2 * (argument - torch.floor(argument + 0.5)))
+    
 
 class FmVCO(VCO):
     """
@@ -701,58 +1134,6 @@ class FmVCO(VCO):
             midi_f0: Fundamental frequency in midi (ignored in this VCO).
         """
         return torch.cos(argument)
-
-
-class SquareSawVCO(VCO):
-    """
-    An oscillator that can take on either a square or a sawtooth waveshape, and
-    can sweep continuously between them, as determined by the
-    :attr:`~torchsynth.module.SquareSawVCO.shape` parameter. A shape value of 0
-    makes a square wave; a shape of 1 makes a saw wave.
-
-    With apologies to Lazzarini and Timoney (2010).
-    `"New perspectives on distortion synthesis for virtual analog oscillators."
-    <https://doi.org/10.1162/comj.2010.34.1.28>`_
-    Computer Music Journal 34, no. 1: 28-40.
-    """
-
-    default_parameter_ranges: List[
-        ModuleParameterRange
-    ] = VCO.default_parameter_ranges + [
-        ModuleParameterRange(
-            0.0, 1.0, name="shape", description="Waveshape - square to saw [0,1]"
-        )
-    ]
-
-    def oscillator(self, argument: Signal, midi_f0: T) -> Signal:
-        """
-        Generates output square/saw audio given a phase argument.
-
-        Args:
-            argument: The phase of the oscillator at each time sample.
-            midi_f0: Fundamental frequency in midi.
-        """
-        partials = self.partials_constant(midi_f0).unsqueeze(1)
-        square = torch.tanh(torch.pi * partials * torch.sin(argument) / 2)
-        shape = self.p("shape").unsqueeze(1)
-        return (1 - shape / 2) * square * (1 + shape * torch.cos(argument))
-
-    def partials_constant(self, midi_f0):
-        """
-        Calculates a value to determine the number of overtones in the resulting
-        square / saw wave, in order to keep aliasing at an acceptable level.
-        Higher fundamental frequencies require fewer partials for a rich sound;
-        lower-frequency sounds can safely have more partials without causing
-        audible aliasing.
-
-        Args:
-            midi_f0: Fundamental frequency in midi.
-        """
-        max_pitch = (
-            midi_f0 + self.p("tuning") + torch.maximum(self.p("mod_depth"), tensor(0))
-        )
-        max_f0 = util.midi_to_hz(max_pitch)
-        return 12000 / (max_f0 * torch.log10(max_f0))
 
 
 class VCA(SynthModule):
